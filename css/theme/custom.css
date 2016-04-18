@@ -1,0 +1,7 @@
+.red {
+   color: red;
+}
+
+.reveal pre code {
+   max-height: 100%;
+}
