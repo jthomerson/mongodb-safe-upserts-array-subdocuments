@@ -7,7 +7,7 @@
       <title>MongoDB - Safely Upserting Subdocuments Into Arrays</title>
 
       <link rel="stylesheet" href="css/reveal.css">
-      <link rel="stylesheet" href="css/theme/black.css">
+      <link rel="stylesheet" href="css/theme/serif.css">
       <link rel="stylesheet" href="css/theme/custom.css">
 
       <!-- Theme used for syntax highlighting of code -->
@@ -29,16 +29,200 @@
                <h1>MongoDB - Safely Upserting Subdocuments Into Arrays</h1>
             </section>
             <section>
-               <h1>Test</h1>
-               <pre><code>
-$ mongo safeupserts
-> db.createCollection('translatablestrings')
-{ "ok" : 1 }
+               <h2>The Problem</h2>
+               <p>
+                  Question: how do you safely upsert a new translation into the
+                  <em>translations</em> array?
+               </p>
+               <p>
+                  Assume that the <em>translations</em> array should not
+                  be allowed to have more than one entry with the same language
+                  code.
+               </p>
+               <pre class="stretch"><code data-trim data-noescape>
+{
+   "_id" : ObjectId("abcdefg"),
+   "category" : "CategoryName",
+   "key" : "YourStringKey",
+   "text" : "The text to translate",
+   "translations" : [
+      {
+         "_id" : ObjectId("zyxwvu"),
+         "language" : "es",
+         "text" : "Spanish translation"
+      }
+   ]
+}
                </code></pre>
             </section>
             <section>
-               <h1>Test</h1>
-               <pre><code>
+               <section>
+                  <h2>How Would You Do It In SQL?</h2>
+                  <p>
+                     In SQL you'd have your translations as a separate table,
+                     maybe something like this:
+                  </p>
+                  <pre><code data-trim data-noescape>
+CREATE TABLE MasterText (
+   MasterText INTEGER UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+   Category VARCHAR(30) NOT NULL,
+   Key VARCHAR(30) NOT NULL,
+   SourceText TEXT
+)
+
+CREATE TABLE Translations (
+   TranslationID INTEGER UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+   MasterTextID INTEGER UNSIGNED NOT NULL,
+   TranslationLang VARCHAR(8) NOT NULL,
+   TranslatedText TEXT,
+   FOREIGN KEY (MasterTextID) REFERENCES MasterText(MasterTextID)
+
+)
+                  </code></pre>
+               </section>
+               <section>
+                  <h2>SQL - Transactions</h2>
+                  <p>
+                     You could use a transaction to SELECT, check to see if you
+                     needed to insert or update, then do the write operation.
+                  </p>
+                  <pre><code data-trim data-noescape>
+START TRANSACTION
+SELECT TranslationID FROM Translations ... (see if the row exists)
+// if the row already exists:
+UPDATE Translations ...
+// if it did not exist:
+INSERT INTO Translations
+COMMIT
+END TRANSACTION
+                  </code></pre>
+               </section>
+               <section>
+                  <h2>SQL - Insert / Select</h2>
+                  <p>
+                     Or, if you preferred not to use transactions, you could avoid
+                     duplicate inserts by using a INSERT ... SELECT with a LEFT
+                     JOIN.
+                  </p>
+                  <pre><code data-trim data-noescape>
+INSERT INTO Translations
+       (MasterTextID, TranslationLang, TranslatedText)
+SELECT mt.MasterTextID, 'fr', 'French translation'
+  FROM MasterText mt
+  LEFT JOIN Translations t
+    ON mt.MasterTextID = t.MasterTextID
+   AND t.TranslationLang = 'fr'
+ WHERE mt.Category = 'CategoryName'
+   AND mt.Key = 'YourStringKey'
+   AND t.TranslationID IS NULL
+                  </code></pre>
+                  <p>
+                     This ensures you won't insert more than one - even in a
+                     race condition. Then you could follow up with an update to
+                     finish the "upsert".
+                  </p>
+               </section>
+               <section>
+                  <h2>SQL - On Duplicate Key Update</h2>
+                  <p>
+                     Or, if you were using MySQL you could use "ON DUPLICATE KEY
+                     UPDATE".
+                  </p>
+                  <pre><code data-trim data-noescape>
+INSERT INTO Translations
+       (MasterTextID, TranslationLang, TranslatedText)
+VALUES ($masterTextID, 'fr', 'French translation')
+    ON DUPLICATE KEY
+UPDATE TranslatedText = 'French translation'
+                  </code></pre>
+               </section>
+            </section>
+            <section>
+               <h2>This Doesn't Work in MongoDB</h2>
+               <ol>
+                  <li class="fragment">
+                     <strong>Transactions</strong>
+                     won't work because there are none. So no select/check if
+                     you should insert or update/then write.
+                  </li>
+                  <li class="fragment">
+                     <strong>Left joins</strong>
+                     won't work because there are none. So no insert ... select
+                     where the existing row is null.
+                  </li>
+                  <li class="fragment">
+                     <strong>On duplicate key update</strong>
+                     won't work because that's not a feature for MongoDB
+                     either.
+                  </li>
+               </ol>
+               <p class="fragment">
+                  So what do you do in MongoDB?
+               </p>
+            </section>
+            <section>
+               <section>
+                  <h2>Wrong: Find/Insert or Update</h2>
+                  <p>
+                     Mongo does not offer transactions, so you can not
+                     atomically do a find and then do:
+                  </p>
+                  <pre><code data-trim data-noescape>
+if (exists) {
+   update();
+} else {
+   insert();
+}
+                  </code></pre>
+               </section>
+               <section>
+                  <h2>Wrong: Update With Upsert</h2>
+                  <p>
+                     Mongo has the following feature:
+                  </p>
+                  <pre><code data-trim data-noescape>
+db.translatablestrings.update(
+   { category: 'CategoryName', key: 'YourStringKey' },
+   { ... your update command },
+   { upsert: true }
+)
+                  </code></pre>
+                  <p>
+                     <strong>The problem</strong> is that the "upsert"
+                     functionality in MongoDB is only made for upserting entire
+                     documents - <em>not</em> for subdocuments.
+                  </p>
+               </section>
+               <section>
+                  <h2>Wrong: $push</h2>
+                  <p>
+                     You can not simply do a $push. If two conflicting
+                     processes do a $push (somewhat-) simultaneously, you end
+                     up with two translations for the same language - which
+                     breaks your application's rules.
+                  </p>
+                  <pre><code data-trim data-noescape>
+$ mongo safeupserts
+db.translatablestrings.update(
+   { category: 'CategoryName', key: 'YourStringKey' },
+   { $push: { translations:
+      { _id: new ObjectId(), language: 'fr', text: 'French translation' }
+   } }
+)
+WriteResult({ "nMatched" : 1, "nUpserted" : 0, "nModified" : 1 })
+                  </code></pre>
+                  <p>
+                     This is the same problem you'd have if you did two inserts
+                     in SQL, but without a SELECT and a LEFT JOIN to check for
+                     duplicates.
+                  </p>
+               </section>
+               <section data-transition="fade-in slide-out">
+                  <h2>Wrong: $push</h2>
+                  <p>
+                     The race condition of using $push can result in duplicates.
+                  </p>
+                  <pre class="stretch"><code data-trim data-noescape>
 {
    "_id" : ObjectId("abcdefg"),
    "category" : "CategoryName",
@@ -48,16 +232,124 @@ $ mongo safeupserts
       {
          "_id" : ObjectId("zyxwvu"),
          "language" : "es",
-         "text" : "The translated text for Spanish"
+         "text" : "Spanish translation"
       },
       {
          "_id" : ObjectId("mnopqrs"),
          "language" : "fr",
-         "text" : "The translated text for French"
+         "text" : "French translation"
+      },
+      {
+         "_id" : ObjectId("ghijlm"),
+         "language" : "fr",
+         "text" : "French translation"
       }
    ]
 }
-               </code></pre>
+                  </code></pre>
+               </section>
+               <section data-transition="fade-in slide-out">
+                  <h2>Wrong: Version Field</h2>
+                  <p>
+                     Some approaches suggest using a select, then insert or
+                     update approach, and relying on a version field to
+                     guarantee that you don't overwrite something. For example:
+                  </p>
+                  <pre class="stretch"><code data-trim data-noescape>
+var o = findObject(),
+    t = o.translationFor('fr');
+
+if (t) {
+   var originalVersion = t._version;
+   t._version++;
+   t.text = 'French translation'
+   // update WHERE DB version = originalVersion
+   db.translatablestrings.update(
+      { category: 'CategoryName', key: 'YourStringKey',
+        'translations.language': 'fr', 'translations._version': originalVersion },
+      { $set: { 'translations.$.text': 'French Translation', 'translations.$._version': t._version } }
+   )
+} else {
+   t = new Translation('fr', 'French translation'); // has _version = 1
+   db.translatablestrings.update(
+      { category: 'CategoryName', key: 'YourStringKey',
+        'translations.language': { $ne: 'fr' } },
+      { $push: { translations: t } }
+   )
+}
+                  </code></pre>
+               </section>
+            </section>
+            <section>
+               <section>
+                  <h2>Right: Push, Check Success, Update</h2>
+                  <p>
+                     Here's the right approach. It guarantees you won't end up
+                     with duplicates even in a race condition.
+                  </p>
+                  <p>
+                     Start by trying to push the subdocument, but only to a
+                     document that doesn't already have a matching subdocument.
+                  </p>
+                  <pre><code data-trim data-noescape>
+db.translatablestrings.update(
+   { category: 'CategoryName', key: 'YourStringKey', 'translations.language': { $ne: 'fr' } },
+   { $push: { translations: { _id: new ObjectId(), language: 'fr', text: 'French translation' } } }
+)
+WriteResult({ "nMatched" : 1, "nUpserted" : 0, "nModified" : 1 })
+                  </code></pre>
+                  <p>
+                     Because there was not already a French translation, we
+                     successfully pushed one.
+                  </p>
+               </section>
+               <section>
+                  <h2>After First Push</h2>
+                  <p>
+                     If you did one successful push, but there was a race
+                     condition and a second operation also did a push, what
+                     would happen?
+                  </p>
+                  <pre><code data-trim data-noescape>
+// to prove that this operation can run safely multiple times,
+// note what happens when you re-run it:
+db.translatablestrings.update(
+   { category: 'CategoryName', key: 'YourStringKey', 'translations.language': { $ne: 'fr' } },
+   { $push: { translations: { _id: new ObjectId(), language: 'fr', text: 'French translation' } } }
+)
+WriteResult({ "nMatched" : 0, "nUpserted" : 0, "nModified" : 0 })
+                  </code></pre>
+                  <p>
+                     Nothing was matched because our document already had a
+                     subdocument with 'fr' as the language.
+                  </p>
+               </section>
+               <section>
+                  <h2>Putting "Up" in "Upsert"</h2>
+                  <p>
+                     So, what if one was already inserted and you need to now
+                     do an update?
+                  </p>
+                  <pre><code data-trim data-noescape>
+// as always, we start by trying to push our new or updated translation
+// if there's not already a translation for that language:
+db.translatablestrings.update( ... $push: { ... } ... }) // same as previous slide
+WriteResult({ "nMatched" : 0, "nUpserted" : 0, "nModified" : 0 })
+
+if (result.nMatched === 0) {
+   // now we know there's an existing document and we simply
+   // do an update directly to the subdocument itself
+   db.translatablestrings.update(
+      { category: 'CategoryName', key: 'YourStringKey', 'translations.language': 'fr' },
+      { $set: { 'translations.$.text': 'French translation' } }
+   )
+}
+WriteResult({ "nMatched" : 1, "nUpserted" : 0, "nModified" : 1 })
+                  </code></pre>
+                  <p>
+                     And it worked! Running it over and over is safe.
+                  </p>
+               </section>
             </section>
          </div>
       </div>
